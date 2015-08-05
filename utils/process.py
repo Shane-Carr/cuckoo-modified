@@ -52,9 +52,9 @@ def process(target=None, copy_path=None, task=None, report=False, auto=False):
             conn = MongoClient(host, port)
             mdata = conn[db]
             fs = GridFS(mdata)
-            analyses = mdata.analysis.find({"info.id": int(task_id)})
+            analyses = mdata.analysis.find({"info.id": int(task["id"])})
             if analyses.count() > 0:
-                log.debug("Deleting analysis data for Task %s" % task_id)
+                log.debug("Deleting analysis data for Task %s" % task["id"])
                 for analysis in analyses:
                     if "file_id" in analysis["target"]:
                         if mdata.analysis.find({"target.file_id": ObjectId(analysis["target"]["file_id"])}).count() == 1:
@@ -74,10 +74,10 @@ def process(target=None, copy_path=None, task=None, report=False, auto=False):
                             mdata.calls.remove({"_id": ObjectId(call)})
                     mdata.analysis.remove({"_id": ObjectId(analysis["_id"])})
             conn.close()
-            log.debug("Deleted previous MongoDB data for Task %s" % task_id)
+            log.debug("Deleted previous MongoDB data for Task %s" % task["id"])
 
         RunReporting(task=task, results=results).run()
-        Database().set_status(task_id, TASK_REPORTED)
+        Database().set_status(task["id"], TASK_REPORTED)
 
         if auto:
             if cfg.cuckoo.delete_original and os.path.exists(target):
