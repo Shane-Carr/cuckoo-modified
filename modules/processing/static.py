@@ -1,4 +1,4 @@
-# Copyright (C) 2010-2015 Cuckoo Foundation, Accuvant, Inc. (bspengler@accuvant.com)
+# Copyright (C) 2010-2015 Cuckoo Foundation, Optiv, Inc. (brad.spengler@optiv.com)
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 
@@ -10,6 +10,7 @@ import lib.cuckoo.common.decoders.njrat as njrat
 import logging
 import os
 import base64
+from datetime import datetime, timedelta
 
 from lib.cuckoo.common.icon import PEGroupIconDir
 from PIL import Image
@@ -89,11 +90,17 @@ def _get_filetype(data):
 class PortableExecutable:
     """PE analysis."""
 
-    def __init__(self, file_path):
+    def __init__(self, file_path, results):
         """@param file_path: file path."""
         self.file_path = file_path
         self.pe = None
+        self.results = results
 
+    def add_statistic(self, name, field, value):
+        self.results["statistics"]["processing"].append({
+            "name": name,
+            field: value,
+        })
 
     def _get_peid_signatures(self):
         """Gets PEID signatures.
@@ -109,6 +116,27 @@ class PortableExecutable:
             return signatures.match_all(self.pe, ep_only=True)
         except:
             return None
+
+    def _get_pdb_path(self):
+        if not self.pe:
+            return None
+
+        try:
+            for dbg in self.pe.DIRECTORY_ENTRY_DEBUG:
+                dbgst = dbg.struct
+                dbgdata = self.pe.__data__[dbgst.PointerToRawData:dbgst.PointerToRawData+dbgst.SizeOfData]
+                if dbgst.Type == 4: #MISC
+                    datatype, length, uniflag = struct.unpack_from("IIB", dbgdata)
+                    return str(dbgdata[12:length]).rstrip('\0')
+                elif dbgst.Type == 2: #CODEVIEW
+                    if dbgdata[:4] == "RSDS":
+                        return str(dbgdata[24:]).rstrip('\0')
+                    elif dbgdata[:4] == "NB10":
+                        return str(dbgdata[16:]).rstrip('\0')
+        except:
+            pass
+
+        return None
 
     def _get_imported_symbols(self):
         """Gets imported symbols.
@@ -264,6 +292,15 @@ class PortableExecutable:
             return None
 
         return "0x{0:08x}".format(self.pe.OPTIONAL_HEADER.ImageBase + self.pe.OPTIONAL_HEADER.AddressOfEntryPoint)
+
+    def _get_osversion(self):
+        """Get minimum required OS version for PE to execute
+        @return: minimum OS version or None.
+        """
+        if not self.pe:
+            return None
+
+        return "{0}.{1}".format(self.pe.OPTIONAL_HEADER.MajorOperatingSystemVersion, self.pe.OPTIONAL_HEADER.MinorOperatingSystemVersion)
 
     def _get_resources(self):
         """Get resources.
@@ -455,9 +492,17 @@ class PortableExecutable:
             return None
 
         results = {}
+
+        pretime = datetime.now()
         results["peid_signatures"] = self._get_peid_signatures()
+        posttime = datetime.now()
+        timediff = posttime - pretime
+        self.add_statistic("peid", "time", float("%d.%03d" % (timediff.seconds, timediff.microseconds / 1000)))
+
         results["pe_imagebase"] = self._get_imagebase()
         results["pe_entrypoint"] = self._get_entrypoint()
+        results["pe_osversion"] = self._get_osversion()
+        results["pe_pdbpath"] = self._get_pdb_path()
         results["pe_imports"] = self._get_imported_symbols()
         results["pe_exports"] = self._get_exported_symbols()
         results["pe_dirents"] = self._get_directory_entries()
@@ -471,12 +516,17 @@ class PortableExecutable:
         results["digital_signers"] = self._get_digital_signers()
         results["imported_dll_count"] = len([x for x in results["pe_imports"] if x.get("dll")])
 
+        
+        pretime = datetime.now()
         darkcomet_config = darkcomet.extract_config(self.file_path, self.pe)
         if darkcomet_config:
             results["darkcomet_config"] = darkcomet_config
         njrat_config = njrat.extract_config(self.file_path)
         if njrat_config:
             results["njrat_config"] = njrat_config
+        posttime = datetime.now()
+        timediff = posttime - pretime
+        self.add_statistic("config_decoder", "time", float("%d.%03d" % (timediff.seconds, timediff.microseconds / 1000)))
 
         return results
 
@@ -737,8 +787,8 @@ class Static(Processing):
 
         if self.task["category"] == "file":
             thetype = File(self.file_path).get_type()
-            if HAVE_PEFILE and ("PE32" in thetype or thetype == "MS-DOS executable"):
-                static = PortableExecutable(self.file_path).run()
+            if HAVE_PEFILE and ("PE32" in thetype or "MS-DOS executable" in thetype):
+                static = PortableExecutable(self.file_path, self.results).run()
             elif "PDF" in thetype:
                 static = PDF(self.file_path).run()
             elif "Word 2007" in thetype or "Excel 2007" in thetype or "PowerPoint 2007" in thetype:

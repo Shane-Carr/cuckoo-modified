@@ -1,4 +1,4 @@
-# Copyright (C) 2010-2015 Cuckoo Foundation, Accuvant, Inc. (bspengler@accuvant.com)
+# Copyright (C) 2010-2015 Cuckoo Foundation, Optiv, Inc. (brad.spengler@optiv.com)
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 
@@ -124,8 +124,7 @@ def dump_file(file_path):
 
     if os.path.isdir(file_path):
         return
-    name = os.path.basename(file_path)
-    file_name = name[name.find(u":")+1:]
+    file_name = os.path.basename(file_path)
     if duplicate:
         idx = DUMPED_LIST.index(sha256)
         upload_path = UPLOADPATH_LIST[idx]
@@ -144,15 +143,24 @@ def dump_file(file_path):
 
 
 def del_file(fname):
-    dump_file(fname)
+
+    deleted_idxes = []
 
     # Filenames are case-insensitive in windows.
-    fnames = [x.lower() for x in FILES_LIST]
+    fnamelower = fname.lower()
+
+    # we only dump files during deletion that we were previously aware of
+    for idx, name in enumerate(FILES_LIST):
+        namelower = name.lower()
+        # dump streams associated with the file too
+        if namelower == fnamelower or (namelower.startswith(fnamelower) and namelower[len(fnamelower)] == ':'):
+            dump_file(name)
+            deleted_idxes.append(idx)
 
     # If this filename exists in the FILES_LIST, then delete it, because it
     # doesn't exist anymore anyway.
-    if fname.lower() in fnames:
-        FILES_LIST.pop(fnames.index(fname.lower()))
+    for idx in deleted_idxes:
+        FILES_LIST.pop(idx)
 
 def move_file(old_fname, new_fname):
     # Filenames are case-insensitive in windows.
@@ -177,6 +185,9 @@ def move_file(old_fname, new_fname):
                replacepath = new_fname
            else:
                replacepath = new_fname + u"\\"
+        elif fname.startswith(lower_old_fname + u":"):
+            matchpath = lower_old_fname + u":"
+            replacepath = new_fname + u":"
 
         if matchpath:
             # Replace the old filename by the new filename, or replace the subdirectory if moved
@@ -255,28 +266,6 @@ class PipeHandler(Thread):
                     hidepids.update([PID, PPID])
                     response = struct.pack("%dI" % len(hidepids), *hidepids)
 
-                # When analyzing we don't want to hook all functions, as we're
-                # having some stability issues with regards to webbrowsers.
-                elif command == "HOOKDLLS":
-                    is_url = Config(cfg="analysis.conf").category != "file"
-
-                    url_dlls = "ntdll", "kernel32"
-
-                    def hookdll_encode(names):
-                        # We have to encode each dll name as unicode string
-                        # with length 16.
-                        names = [name + "\x00" * (16-len(name)) for name in names]
-                        f = lambda s: "".join(ch + "\x00" for ch in s)
-                        return "".join(f(name) for name in names)
-
-                    # If this sample is not a URL, then we don't want to limit
-                    # any API hooks (at least for now), so we write a null-byte
-                    # which indicates that all DLLs should be hooked.
-                    if not is_url:
-                        response = "\x00"
-                    else:
-                        response = hookdll_encode(url_dlls)
-
                 # remove pid from process list because we received a notification
                 # from kernel land
                 elif command.startswith("KTERMINATE:"):
@@ -347,6 +336,17 @@ class PipeHandler(Thread):
                 elif command.startswith("RESUME:"):
                     LASTINJECT_TIME = datetime.now()
 
+                # Handle attempted shutdowns/restarts -- flush logs for all monitored processes
+                # additional handling can be added later
+                elif command.startswith("SHUTDOWN:"):
+                    PROCESS_LOCK.acquire()
+                    for process_id in PROCESS_LIST:
+                        event_name = TERMINATE_EVENT + str(process_id)
+                        event_handle = KERNEL32.OpenEventA(EVENT_MODIFY_STATE, False, event_name)
+                        if event_handle:
+                            KERNEL32.SetEvent(event_handle)
+                            KERNEL32.CloseHandle(event_handle)
+                    PROCESS_LOCK.release()
                 # Handle case of malware terminating a process -- notify the target
                 # ahead of time so that it can flush its log buffer
                 elif command.startswith("KILL:"):
@@ -752,14 +752,11 @@ class Analyzer:
             except (NotImplementedError, AttributeError):
                 log.warning("Auxiliary module %s was not implemented",
                             module.__name__)
-                continue
             except Exception as e:
                 log.warning("Cannot execute auxiliary module %s: %s",
                             module.__name__, e)
-                continue
-            finally:
-                log.debug("Started auxiliary module %s",
-                          module.__name__)
+            else:
+                log.debug("Started auxiliary module %s", module.__name__)
                 aux_enabled.append(aux)
 
         # Start analysis package. If for any reason, the execution of the
@@ -803,6 +800,8 @@ class Analyzer:
         if kernel_analysis != False:
             kernel_analysis = True
 
+        emptytime = None
+
         while True:
             time_counter += 1
             if time_counter == int(self.config.timeout):
@@ -829,9 +828,14 @@ class Analyzer:
                         # If none of the monitored processes are still alive, we
                         # can terminate the analysis.
                         if not PROCESS_LIST and (not LASTINJECT_TIME or (datetime.now() >= (LASTINJECT_TIME + timedelta(seconds=15)))):
-                            log.info("Process list is empty, "
-                                    "terminating analysis.")
-                            break
+                            if emptytime and (datetime.now() >= (emptytime + timedelta(seconds=5))):
+                                log.info("Process list is empty, "
+                                        "terminating analysis.")
+                                break
+                            elif not emptytime:
+                                emptytime = datetime.now()
+                        else:
+                            emptytime = None
 
                     # Update the list of monitored processes available to the
                     # analysis package. It could be used for internal
